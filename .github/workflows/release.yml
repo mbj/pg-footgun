@@ -1,0 +1,82 @@
+name: Release
+
+# A release is cut by pushing a `pg-footgun-<N>` tag (matching FOOTGUN_RELEASE).
+# It rebuilds every supported Debian minor (running the full suite via
+# dpkg-buildpackage) and pushes the patched images to ghcr.io/mbj/postgres, both
+# the immutable `<version>-pg-footgun-<N>` tag and the moving `<version>-pg-footgun`.
+on:
+  push:
+    tags:
+    - 'pg-footgun-*'
+
+env:
+  RUST_BACKTRACE: full
+
+jobs:
+  # Build the driver once; the push matrix inherits the artifact.
+  build:
+    name: Build driver
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          ~/.rustup
+        key: ubuntu-24.04-rustup-${{ hashFiles('rust-toolchain.toml') }}
+    - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/git/db/
+          ~/.cargo/registry/cache/
+          ~/.cargo/registry/index/
+        key: ubuntu-24.04-cargo-${{ hashFiles('.github/workflows/release.yml', '**/Cargo.lock', 'rust-toolchain.toml') }}
+
+    - name: Build
+      run: cargo --verbose build --release
+
+    - name: Upload driver
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: pg-footgun
+        path: target/release/pg-footgun
+        retention-days: 7
+
+  # One job per supported minor. `push debian-*` builds the .debs (full suite),
+  # overlays the patched image, and pushes it. Runs in the postgres:<version>
+  # container, so only the runtime + a ghcr login are needed.
+  push:
+    name: Push (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+        - debian-18.4
+        - debian-18.3
+        - debian-17.10
+        - debian-16.14
+        - debian-15.18
+        - debian-15.17
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+    - name: Download driver
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: pg-footgun
+        path: bin
+
+    - name: Make driver executable
+      run: chmod +x bin/pg-footgun
+
+    - name: Log in to ghcr.io
+      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username ${{ github.actor }} --password-stdin
+
+    - name: Build and push patched image
+      run: bin/pg-footgun push ${{ matrix.target }}

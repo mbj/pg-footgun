@@ -1,0 +1,30 @@
+[package]
+name = "pg-footgun"
+version = "0.1.0"
+edition.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Build and maintain patched PostgreSQL OCI images that surface silent footguns"
+license = "MIT"
+repository = "https://github.com/mbj/pg-footgun"
+readme = "README.md"
+keywords = ["postgresql", "oci", "patch", "footgun", "podman"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+cmd-proc.workspace = true
+env_logger.workspace = true
+git-proc.workspace = true
+log.workspace = true
+ociman.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "pg-footgun"
+path = "src/bin/pg-footgun.rs"
