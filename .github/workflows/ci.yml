@@ -1,0 +1,121 @@
+name: CI
+
+on: push
+
+env:
+  RUST_BACKTRACE: full
+
+jobs:
+  # Build the driver once; the matrices below inherit the artifact.
+  build:
+    name: Build driver
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+    - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          ~/.rustup
+        key: ubuntu-24.04-rustup-${{ hashFiles('rust-toolchain.toml') }}
+    - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/git/db/
+          ~/.cargo/registry/cache/
+          ~/.cargo/registry/index/
+        key: ubuntu-24.04-cargo-${{ hashFiles('.github/workflows/ci.yml', '**/Cargo.lock', 'rust-toolchain.toml') }}
+
+    - name: Run fmt
+      run: cargo --verbose fmt --check
+
+    - name: Build
+      run: cargo --verbose build --all-targets --release
+
+    - name: Run clippy
+      run: cargo --verbose clippy --all-targets --release
+
+    - name: Check for dirty repository
+      run: git diff --exit-code
+
+    - name: Upload driver
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: pg-footgun
+        path: target/release/pg-footgun
+        retention-days: 7
+
+  # `test upstream-*` builds and runs `make check` on the runner, so it needs the
+  # PostgreSQL build dependencies.
+  upstream-build:
+    name: Build (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+        - upstream-master
+        - upstream-19beta2
+        - upstream-18.4
+        - upstream-18.3
+        - upstream-17.10
+        - upstream-16.14
+        - upstream-15.18
+        - upstream-15.17
+        - upstream-15.12
+        - upstream-15.10
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+    - name: Install PostgreSQL build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes --no-install-recommends \
+          build-essential bison flex perl pkg-config \
+          libreadline-dev zlib1g-dev libicu-dev libxml2-dev
+
+    - name: Download driver
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: pg-footgun
+        path: bin
+
+    - name: Make driver executable
+      run: chmod +x bin/pg-footgun
+
+    - name: Verify patch (setup, checkout, apply, build, regress)
+      run: bin/pg-footgun test ${{ matrix.target }}
+
+  # `image debian-*` builds the .debs (running the full suite via
+  # dpkg-buildpackage, in the postgres:<version> container — only the runtime is
+  # needed, no host deps) and then overlays the patched server onto the base
+  # image. Each entry is a minor PGDG still carries.
+  debian-build:
+    name: Build (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+        - debian-18.4
+        - debian-18.3
+        - debian-17.10
+        - debian-16.14
+        - debian-15.18
+        - debian-15.17
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+    - name: Download driver
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: pg-footgun
+        path: bin
+
+    - name: Make driver executable
+      run: chmod +x bin/pg-footgun
+
+    - name: Build patched image (.debs + full suite, then overlay)
+      run: bin/pg-footgun image ${{ matrix.target }}

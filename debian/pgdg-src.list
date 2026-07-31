@@ -1,0 +1,5 @@
+# PGDG source index, mounted read into the build container so `apt-get source
+# postgresql-<major>` can fetch Debian's exact source package. The official
+# postgres:<tag> images are built on Debian 13 (trixie) from PGDG, and ship only
+# the binary `deb` line; this adds the matching `deb-src` line.
+deb-src http://apt.postgresql.org/pub/repos/apt trixie-pgdg main

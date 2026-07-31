@@ -1,0 +1,872 @@
+From bb884992b8e385010e4671dcdf928c4727b03168 Mon Sep 17 00:00:00 2001
+From: Markus Schirp <mbj@schirp-dso.com>
+Date: Tue, 21 Jul 2026 02:34:34 +0000
+Subject: [PATCH] Add join_collapse_limit_excess to surface silent join-order
+ degradation
+
+When a query's explicit JOINs exceed join_collapse_limit, the planner
+silently stops flattening them and skips exhaustive join-order search for
+that subproblem.  This is invisible: a query that accumulates joins over
+time (ORM eager-loads, generated SQL, nested views) can cross the limit
+and get a substantially worse plan with no signal other than "it got
+slow", and nothing points at join_collapse_limit as the cause.  This has
+been the source of production incidents that were hard to diagnose.
+
+Add a PGC_USERSET enum GUC, join_collapse_limit_excess, controlling what
+happens at that point:
+
+  off    historical behavior; stay silent (default)
+  warn   emit a WARNING naming the FROM items involved
+  error  raise an ERROR, preventing execution
+
+warn suits observability (logging, CI); error suits fail-fast in
+development and test.  The default is off, so installations that do not
+opt in are unaffected.
+
+deconstruct_recurse() reaches the collapse decision once per JoinExpr,
+so a chain of explicit joins crosses the limit once per join.  Reporting
+on the spot would emit one diagnostic per join rather than one per
+chain, so mark the jointree item instead and have deconstruct_jointree()
+report only those subproblems that no other flagged subproblem encloses.
+A chain therefore yields a single report naming its outermost construct,
+while parts of a statement independent of one another are each reported
+in their own right.
+
+The report names the FROM items of that subproblem and states how many
+would have to be considered together, and the hint gives the value
+join_collapse_limit needs in order to let the planner order them.  Both
+modes emit identical text, differing only in severity.
+
+Because the check runs during planning, it applies to any planned query,
+including those planned via SPI (e.g. PL/pgSQL); the error is a normal,
+trappable program_limit_exceeded exception.
+---
+ doc/src/sgml/config.sgml                      |  42 +++
+ src/backend/optimizer/plan/initsplan.c        | 143 ++++++++++
+ src/backend/utils/misc/guc_tables.c           |  17 ++
+ src/backend/utils/misc/postgresql.conf.sample |   2 +
+ src/include/optimizer/planmain.h              |  15 +
+ src/test/regress/expected/guc.out             |   7 +-
+ .../expected/join_collapse_limit_excess.out   | 258 ++++++++++++++++++
+ src/test/regress/parallel_schedule            |   2 +-
+ .../sql/join_collapse_limit_excess.sql        | 163 +++++++++++
+ src/tools/pgindent/typedefs.list              |   1 +
+ 10 files changed, 646 insertions(+), 4 deletions(-)
+ create mode 100644 src/test/regress/expected/join_collapse_limit_excess.out
+ create mode 100644 src/test/regress/sql/join_collapse_limit_excess.sql
+
+diff --git a/doc/src/sgml/config.sgml b/doc/src/sgml/config.sgml
+index c92b8e41879..ead3bdd72ce 100644
+--- a/doc/src/sgml/config.sgml
++++ b/doc/src/sgml/config.sgml
+@@ -6382,6 +6382,48 @@ SELECT * FROM parent WHERE key = 2400;
+       </listitem>
+      </varlistentry>
+ 
++     <varlistentry id="guc-join-collapse-limit-excess" xreflabel="join_collapse_limit_excess">
++      <term><varname>join_collapse_limit_excess</varname> (<type>enum</type>)
++      <indexterm>
++       <primary><varname>join_collapse_limit_excess</varname> configuration parameter</primary>
++      </indexterm>
++      </term>
++      <listitem>
++       <para>
++        Controls what happens when the planner stops flattening explicit
++        <literal>JOIN</literal> constructs because the resulting
++        <literal>FROM</literal>-list would exceed
++        <xref linkend="guc-join-collapse-limit"/>.  When set to
++        <literal>off</literal> (the default), this happens silently, as it
++        always has: the planner simply keeps the explicit join order beyond
++        that point.  When set to <literal>warn</literal>, a
++        <literal>WARNING</literal> is emitted naming the
++        <literal>FROM</literal> items involved.  When set to
++        <literal>error</literal>, an error is raised instead, preventing the
++        query from executing.
++       </para>
++
++       <para>
++        A chain of explicit joins passes the limit once per
++        <literal>JOIN</literal>, but the chain produces a single report: the
++        one for its outermost construct, whose <literal>FROM</literal> items
++        include those of all the others.  Constructs that do not enclose one
++        another are reported separately, so a statement whose join order is
++        constrained in several independent places produces one report for
++        each of them.
++       </para>
++
++       <para>
++        This is useful for detecting queries whose join order the planner is
++        no longer free to optimize.  Note that, because the check occurs
++        during planning, it applies to any query that is planned, including
++        those run through <application>PL/pgSQL</application> and other
++        <acronym>SPI</acronym> callers, but not to reuse of an already-cached
++        plan.
++       </para>
++      </listitem>
++     </varlistentry>
++
+      <varlistentry id="guc-plan-cache-mode" xreflabel="plan_cache_mode">
+       <term><varname>plan_cache_mode</varname> (<type>enum</type>)
+       <indexterm>
+diff --git a/src/backend/optimizer/plan/initsplan.c b/src/backend/optimizer/plan/initsplan.c
+index 0d748973a4e..0c5491f09a8 100644
+--- a/src/backend/optimizer/plan/initsplan.c
++++ b/src/backend/optimizer/plan/initsplan.c
+@@ -15,6 +15,7 @@
+ #include "postgres.h"
+ 
+ #include "catalog/pg_type.h"
++#include "lib/stringinfo.h"
+ #include "nodes/makefuncs.h"
+ #include "nodes/nodeFuncs.h"
+ #include "optimizer/clauses.h"
+@@ -29,6 +30,7 @@
+ #include "optimizer/planner.h"
+ #include "optimizer/restrictinfo.h"
+ #include "parser/analyze.h"
++#include "parser/parsetree.h"
+ #include "rewrite/rewriteManip.h"
+ #include "utils/lsyscache.h"
+ #include "utils/rel.h"
+@@ -37,6 +39,7 @@
+ /* These parameters are set by GUC */
+ int			from_collapse_limit;
+ int			join_collapse_limit;
++int			join_collapse_limit_excess = JOIN_COLLAPSE_LIMIT_EXCESS_OFF;
+ 
+ 
+ /*
+@@ -72,6 +75,9 @@ typedef struct JoinTreeItem
+ 	Relids		right_rels;		/* if join node, Relids of the right side */
+ 	Relids		nonnullable_rels;	/* if outer join, Relids of the
+ 									 * non-nullable side */
++	bool		join_collapse_excess;	/* true if join_collapse_limit stopped
++										 * this node's subproblems from being
++										 * flattened */
+ 	/* Fields filled during deconstruct_distribute: */
+ 	SpecialJoinInfo *sjinfo;	/* if outer join, its SpecialJoinInfo */
+ 	List	   *oj_joinclauses; /* outer join quals not yet distributed */
+@@ -86,6 +92,9 @@ static List *deconstruct_recurse(PlannerInfo *root, Node *jtnode,
+ 								 JoinDomain *parent_domain,
+ 								 JoinTreeItem *parent_jtitem,
+ 								 List **item_list);
++static char *join_collapse_item_names(PlannerInfo *root, Relids relids,
++									  int *nitems);
++static void report_join_collapse_excess(PlannerInfo *root, List *item_list);
+ static void deconstruct_distribute(PlannerInfo *root, JoinTreeItem *jtitem);
+ static void process_security_barrier_quals(PlannerInfo *root,
+ 										   int rti, JoinTreeItem *jtitem);
+@@ -774,6 +783,14 @@ deconstruct_jointree(PlannerInfo *root)
+ 	/* ... which should match what we computed for the top join domain */
+ 	Assert(bms_equal(root->all_query_rels, top_jdomain->jd_relids));
+ 
++	/*
++	 * Now that the whole jointree has been scanned, we know which subproblems
++	 * join_collapse_limit kept us from flattening, and can report that once
++	 * for the query if the user asked us to.
++	 */
++	if (join_collapse_limit_excess != JOIN_COLLAPSE_LIMIT_EXCESS_OFF)
++		report_join_collapse_excess(root, item_list);
++
+ 	/* Now scan all the jointree nodes again, and distribute quals */
+ 	foreach(lc, item_list)
+ 	{
+@@ -1084,6 +1101,16 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
+ 			Node	   *leftpart,
+ 					   *rightpart;
+ 
++			/*
++			 * Record that join_collapse_limit prevented us from flattening
++			 * this subproblem.  We don't report it here: a chain of explicit
++			 * joins reaches this point once per JoinExpr, so reporting on the
++			 * spot would emit one diagnostic per join rather than one per
++			 * query.  deconstruct_jointree reports the outermost one after
++			 * the whole jointree has been scanned.
++			 */
++			jtitem->join_collapse_excess = true;
++
+ 			/* avoid creating useless 1-element sublists */
+ 			if (list_length(leftjoinlist) == 1)
+ 				leftpart = (Node *) linitial(leftjoinlist);
+@@ -1109,6 +1136,122 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
+ 	return joinlist;
+ }
+ 
++/*
++ * join_collapse_item_names
++ *	  Build a comma-separated, quoted list of the FROM items in the given relid
++ *	  set, and return the number of items named in *nitems.
++ *
++ * The set (a join subproblem's qualscope) may include join RTEs and other
++ * non-scan entries.  We switch over every RTEKind, with no default, so that
++ * the relations we name are chosen explicitly and so that adding a future
++ * RTEKind forces a compile-time decision here rather than silently changing
++ * the output.
++ */
++static char *
++join_collapse_item_names(PlannerInfo *root, Relids relids, int *nitems)
++{
++	StringInfoData buf;
++	int			relid = -1;
++
++	*nitems = 0;
++	initStringInfo(&buf);
++	while ((relid = bms_next_member(relids, relid)) >= 0)
++	{
++		RangeTblEntry *rte = planner_rt_fetch(relid, root);
++
++		switch (rte->rtekind)
++		{
++			case RTE_RELATION:
++			case RTE_SUBQUERY:
++			case RTE_FUNCTION:
++			case RTE_TABLEFUNC:
++			case RTE_VALUES:
++			case RTE_CTE:
++			case RTE_NAMEDTUPLESTORE:
++			case RTE_RESULT:
++				/* a FROM-list item the planner must join: name it */
++				if (*nitems > 0)
++					appendStringInfoString(&buf, ", ");
++				appendStringInfo(&buf, "\"%s\"", rte->eref->aliasname);
++				(*nitems)++;
++				break;
++
++			case RTE_JOIN:
++
++				/*
++				 * Not a FROM-list item: RTE_JOIN is a join's output-column
++				 * artifact, whose base relations are already named in their
++				 * own right.
++				 */
++				break;
++		}
++	}
++	return buf.data;
++}
++
++/*
++ * report_join_collapse_excess
++ *	  Report, per join_collapse_limit_excess, that join_collapse_limit stopped
++ *	  the planner from flattening part of the jointree.
++ *
++ * A chain of explicit joins crosses the limit once per JoinExpr, so several
++ * items may be flagged for one query.  Reporting all of them would bury the
++ * user in near-duplicate messages, since each one's items are contained in
++ * the next.  Report only the subproblems that no other flagged subproblem
++ * encloses: a chain therefore yields a single report naming its outermost
++ * construct, while subproblems independent of one another are each reported
++ * in their own right.
++ *
++ * item_list is built bottom-up, so an enclosing subproblem always appears
++ * later in the list than the ones it encloses.  Comparing only against later
++ * items also settles the case of two flagged items with equal qualscopes,
++ * where a plain subset test would discard both.
++ */
++static void
++report_join_collapse_excess(PlannerInfo *root, List *item_list)
++{
++	ListCell   *lc;
++
++	foreach(lc, item_list)
++	{
++		JoinTreeItem *jtitem = (JoinTreeItem *) lfirst(lc);
++		ListCell   *lc2;
++		bool		enclosed = false;
++		char	   *itemnames;
++		int			nitems;
++
++		if (!jtitem->join_collapse_excess)
++			continue;
++
++		/* Skip it if some enclosing subproblem was flagged as well */
++		for_each_cell(lc2, item_list, lnext(item_list, lc))
++		{
++			JoinTreeItem *outer = (JoinTreeItem *) lfirst(lc2);
++
++			if (outer->join_collapse_excess &&
++				bms_is_subset(jtitem->qualscope, outer->qualscope))
++			{
++				enclosed = true;
++				break;
++			}
++		}
++		if (enclosed)
++			continue;
++
++		itemnames = join_collapse_item_names(root, jtitem->qualscope, &nitems);
++
++		ereport(join_collapse_limit_excess == JOIN_COLLAPSE_LIMIT_EXCESS_ERROR ?
++				ERROR : WARNING,
++				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
++				 errmsg("join order optimization stopped because join_collapse_limit (%d) was exceeded",
++						join_collapse_limit),
++				 errdetail("Optimizing the join order of %s would require considering %d items together.",
++						   itemnames, nitems),
++				 errhint("Increase join_collapse_limit to at least %d to let the planner choose the join order for these items.",
++						 nitems)));
++	}
++}
++
+ /*
+  * deconstruct_distribute
+  *	  Process one jointree node in phase 2 of deconstruct_jointree processing.
+diff --git a/src/backend/utils/misc/guc_tables.c b/src/backend/utils/misc/guc_tables.c
+index 6eccfa85428..c5f758664a3 100644
+--- a/src/backend/utils/misc/guc_tables.c
++++ b/src/backend/utils/misc/guc_tables.c
+@@ -336,6 +336,13 @@ static const struct config_enum_entry constraint_exclusion_options[] = {
+ 	{NULL, 0, false}
+ };
+ 
++static const struct config_enum_entry join_collapse_limit_excess_options[] = {
++	{"off", JOIN_COLLAPSE_LIMIT_EXCESS_OFF, false},
++	{"warn", JOIN_COLLAPSE_LIMIT_EXCESS_WARN, false},
++	{"error", JOIN_COLLAPSE_LIMIT_EXCESS_ERROR, false},
++	{NULL, 0, false}
++};
++
+ /*
+  * Although only "on", "off", "remote_apply", "remote_write", and "local" are
+  * documented, we accept all the likely variants of "on" and "off".
+@@ -4750,6 +4757,16 @@ struct config_enum ConfigureNamesEnum[] =
+ 		NULL, NULL, NULL
+ 	},
+ 
++	{
++		{"join_collapse_limit_excess", PGC_USERSET, QUERY_TUNING_OTHER,
++			gettext_noop("Sets the action taken when join_collapse_limit is exceeded."),
++			gettext_noop("When the planner stops flattening explicit JOIN constructs because the resulting FROM-list would exceed join_collapse_limit, this controls whether that is silent (off), reported as a warning (warn), or raised as an error (error).")
++		},
++		&join_collapse_limit_excess,
++		JOIN_COLLAPSE_LIMIT_EXCESS_OFF, join_collapse_limit_excess_options,
++		NULL, NULL, NULL
++	},
++
+ 	{
+ 		{"bytea_output", PGC_USERSET, CLIENT_CONN_STATEMENT,
+ 			gettext_noop("Sets the output format for bytea."),
+diff --git a/src/backend/utils/misc/postgresql.conf.sample b/src/backend/utils/misc/postgresql.conf.sample
+index 6c761f83165..e7395c9bb22 100644
+--- a/src/backend/utils/misc/postgresql.conf.sample
++++ b/src/backend/utils/misc/postgresql.conf.sample
+@@ -460,6 +460,8 @@
+ #jit = on				# allow JIT compilation
+ #join_collapse_limit = 8		# 1 disables collapsing of explicit
+ 					# JOIN clauses
++#join_collapse_limit_excess = off	# off, warn, or error when
++					# join_collapse_limit is exceeded
+ #plan_cache_mode = auto			# auto, force_generic_plan or
+ 					# force_custom_plan
+ #recursive_worktable_factor = 10.0	# range 0.001-1000000
+diff --git a/src/include/optimizer/planmain.h b/src/include/optimizer/planmain.h
+index aafc1737921..ff18517bf21 100644
+--- a/src/include/optimizer/planmain.h
++++ b/src/include/optimizer/planmain.h
+@@ -61,11 +61,26 @@ extern Limit *make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount,
+ 						 AttrNumber *uniqColIdx, Oid *uniqOperators,
+ 						 Oid *uniqCollations);
+ 
++/*
++ * How strictly to react when join_collapse_limit is exceeded, i.e. when the
++ * planner stops flattening explicit JOIN constructs because doing so would
++ * produce a FROM-list larger than join_collapse_limit.  This is historically
++ * silent (JOIN_COLLAPSE_LIMIT_EXCESS_OFF); the other modes make it
++ * observable or turn it into a hard error.
++ */
++typedef enum
++{
++	JOIN_COLLAPSE_LIMIT_EXCESS_OFF, /* silently stop collapsing (default) */
++	JOIN_COLLAPSE_LIMIT_EXCESS_WARN,	/* stop collapsing, emit a WARNING */
++	JOIN_COLLAPSE_LIMIT_EXCESS_ERROR,	/* raise an ERROR instead */
++} JoinCollapseLimitExcess;
++
+ /*
+  * prototypes for plan/initsplan.c
+  */
+ extern PGDLLIMPORT int from_collapse_limit;
+ extern PGDLLIMPORT int join_collapse_limit;
++extern PGDLLIMPORT int join_collapse_limit_excess;
+ 
+ extern void add_base_rels_to_query(PlannerInfo *root, Node *jtnode);
+ extern void add_other_rels_to_query(PlannerInfo *root);
+diff --git a/src/test/regress/expected/guc.out b/src/test/regress/expected/guc.out
+index 455b6d6c0ce..a96198616ed 100644
+--- a/src/test/regress/expected/guc.out
++++ b/src/test/regress/expected/guc.out
+@@ -858,10 +858,11 @@ SELECT name FROM tab_settings_flags
+ SELECT name FROM tab_settings_flags
+   WHERE category ~ '^Query Tuning' AND NOT explain
+   ORDER BY 1;
+-           name            
+----------------------------
++            name            
++----------------------------
+  default_statistics_target
+-(1 row)
++ join_collapse_limit_excess
++(2 rows)
+ 
+ -- Runtime-computed GUCs should be part of the preset category.
+ SELECT name FROM tab_settings_flags
+diff --git a/src/test/regress/expected/join_collapse_limit_excess.out b/src/test/regress/expected/join_collapse_limit_excess.out
+new file mode 100644
+index 00000000000..abf4511901a
+--- /dev/null
++++ b/src/test/regress/expected/join_collapse_limit_excess.out
+@@ -0,0 +1,258 @@
++--
++-- JOIN_COLLAPSE_LIMIT_EXCESS
++--
++-- Exercise the join_collapse_limit_excess GUC, which selects what happens when
++-- the planner stops flattening explicit JOIN constructs because doing so would
++-- exceed join_collapse_limit: stay silent (off), emit a WARNING (warn), or
++-- raise an ERROR (error).  In the warn/error cases the base relations of the
++-- subproblem that could not be flattened are reported.
++--
++CREATE TEMP TABLE table_a (id int);
++CREATE TEMP TABLE table_b (id int);
++CREATE TEMP TABLE table_c (id int);
++-- Default is off.
++SHOW join_collapse_limit_excess;
++ join_collapse_limit_excess 
++----------------------------
++ off
++(1 row)
++
++-- Only off/warn/error are accepted.
++SET join_collapse_limit_excess = 'bogus';
++ERROR:  invalid value for parameter "join_collapse_limit_excess": "bogus"
++HINT:  Available values: off, warn, error.
++-- Make the limit small so a modest explicit join exceeds it.
++SET join_collapse_limit = 2;
++-- A two-way join stays within the limit: no diagnostic even in error mode.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a JOIN table_b USING (id);
++ id 
++----
++(0 rows)
++
++-- A three-way explicit join exceeds join_collapse_limit = 2.
++-- warn: reports the relations but still plans and runs the query.
++SET join_collapse_limit_excess = 'warn';
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id 
++----
++(0 rows)
++
++-- error: the same query is rejected before execution.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++ERROR:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++-- off: the historical behavior, silent.
++SET join_collapse_limit_excess = 'off';
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++ id 
++----
++(0 rows)
++
++-- The reported set includes non-table FROM items such as an
++-- optimization-fenced subquery, named by the alias SQL requires for it.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a JOIN table_b USING (id)
++  JOIN (SELECT id FROM table_c OFFSET 0) subquery USING (id);
++ERROR:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "subquery" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++-- A FULL JOIN forces the join order independently of join_collapse_limit, so it
++-- must not trigger the diagnostic.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a FULL JOIN table_b USING (id) FULL JOIN table_c USING (id);
++ id 
++----
++(0 rows)
++
++-- The check runs during planning, so it also applies to queries planned via
++-- SPI (here, PL/pgSQL), and the error is a normal, trappable exception with
++-- SQLSTATE program_limit_exceeded.
++SET join_collapse_limit_excess = 'error';
++DO $$
++BEGIN
++  PERFORM * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++EXCEPTION WHEN program_limit_exceeded THEN
++  RAISE NOTICE 'caught program_limit_exceeded from join_collapse_limit_excess';
++END $$;
++NOTICE:  caught program_limit_exceeded from join_collapse_limit_excess
++-- The planner reaches the collapse decision once per JoinExpr, so a chain of
++-- explicit joins crosses the limit once per join as it is walked.  Only the
++-- outermost such subproblem is reported, so the chain yields one diagnostic
++-- however long it is, and the relation count reported matches the number of
++-- relations named.
++CREATE TEMP TABLE table_d (id int);
++CREATE TEMP TABLE table_e (id int);
++SET join_collapse_limit_excess = 'warn';
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id 
++----
++(0 rows)
++
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id)
++  JOIN table_d USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c", "table_d" would require considering 4 items together.
++HINT:  Increase join_collapse_limit to at least 4 to let the planner choose the join order for these items.
++ id 
++----
++(0 rows)
++
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id)
++  JOIN table_d USING (id) JOIN table_e USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c", "table_d", "table_e" would require considering 5 items together.
++HINT:  Increase join_collapse_limit to at least 5 to let the planner choose the join order for these items.
++ id 
++----
++(0 rows)
++
++-- error reports the same subproblem that warn does.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id)
++  JOIN table_d USING (id) JOIN table_e USING (id);
++ERROR:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c", "table_d", "table_e" would require considering 5 items together.
++HINT:  Increase join_collapse_limit to at least 5 to let the planner choose the join order for these items.
++-- That collapsing happens once per planning problem, not once per statement.
++-- A subquery that cannot be pulled up is planned on its own, so it is scanned
++-- for collapsing on its own and reported on its own.  Here two optimization
++-- fences each exceed the limit, and one statement yields two diagnostics.
++SET join_collapse_limit_excess = 'warn';
++SELECT * FROM
++  (SELECT table_a.id FROM table_a JOIN table_b USING (id)
++     JOIN table_c USING (id) OFFSET 0) fence_one,
++  (SELECT table_a.id FROM table_a JOIN table_b USING (id)
++     JOIN table_c USING (id) OFFSET 0) fence_two;
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id | id 
++----+----
++(0 rows)
++
++-- error cannot report both: the first planning problem to exceed the limit
++-- aborts the statement before the second one is planned.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM
++  (SELECT table_a.id FROM table_a JOIN table_b USING (id)
++     JOIN table_c USING (id) OFFSET 0) fence_one,
++  (SELECT table_a.id FROM table_a JOIN table_b USING (id)
++     JOIN table_c USING (id) OFFSET 0) fence_two;
++ERROR:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++-- Subproblems that do not enclose one another are reported separately, even
++-- within a single planning problem: here two comma-separated join chains each
++-- exceed the limit, and neither contains the other.
++SET join_collapse_limit_excess = 'warn';
++SELECT * FROM
++  table_a JOIN table_b USING (id) JOIN table_c USING (id),
++  table_d JOIN table_e USING (id) JOIN table_a AS a2 USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_d", "table_e", "a2" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id | id 
++----+----
++(0 rows)
++
++-- Every kind of FROM item that can be a leaf of a join subproblem is named.
++-- RTE_RELATION and RTE_SUBQUERY are covered above; the rest follow.  Join RTEs
++-- are deliberately not named, since they are an artifact of the join itself
++-- rather than something the user can act on.  RTE_GROUP is never part of the
++-- jointree and RTE_GRAPH_TABLE is rewritten to a subquery before planning, so
++-- neither can reach the report.
++SET join_collapse_limit_excess = 'warn';
++-- RTE_VALUES.  A single-row VALUES is folded away by pull_up_simple_values(),
++-- so use two rows to keep it in the jointree.
++SELECT * FROM table_a JOIN table_b USING (id)
++  JOIN (VALUES (1), (2)) AS values_list(id) USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "*VALUES*" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id 
++----
++(0 rows)
++
++-- RTE_FUNCTION
++SELECT * FROM table_a JOIN table_b USING (id)
++  JOIN generate_series(1, 2) AS function(id) USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "function" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id 
++----
++(0 rows)
++
++-- RTE_TABLEFUNC
++SELECT * FROM table_a JOIN table_b USING (id)
++  JOIN JSON_TABLE('[1]'::jsonb, '$[*]' COLUMNS (id int PATH '$')) AS json_table
++  USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "json_table" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id 
++----
++(0 rows)
++
++-- RTE_CTE
++WITH cte AS MATERIALIZED (SELECT 1 AS id)
++SELECT * FROM table_a JOIN table_b USING (id) JOIN cte USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "cte" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id 
++----
++(0 rows)
++
++-- RTE_RESULT.  An empty-FROM subquery normally disappears, but one under an
++-- outer join survives to the planner as a jointree leaf.
++SELECT * FROM table_a JOIN table_b USING (id)
++  LEFT JOIN (SELECT 1 AS id) result ON result.id = table_a.id;
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "*RESULT*" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id | id 
++----+----
++(0 rows)
++
++-- RTE_NAMEDTUPLESTORE, via a trigger transition table.
++CREATE TEMP TABLE trig_t (id int);
++CREATE FUNCTION pg_temp.trig_f() RETURNS trigger LANGUAGE plpgsql AS $$
++BEGIN
++  PERFORM * FROM table_a JOIN table_b USING (id) JOIN new_rows USING (id);
++  RETURN NULL;
++END $$;
++CREATE TRIGGER trig_tr AFTER INSERT ON trig_t
++  REFERENCING NEW TABLE AS new_rows
++  FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.trig_f();
++INSERT INTO trig_t VALUES (1);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "new_rows" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++-- RTE_JOIN is skipped: each outer join adds its own RTE to the subproblem, so
++-- this reports three relations rather than five.
++SELECT * FROM table_a LEFT JOIN table_b USING (id) LEFT JOIN table_c USING (id);
++WARNING:  join order optimization stopped because join_collapse_limit (2) was exceeded
++DETAIL:  Optimizing the join order of "table_a", "table_b", "table_c" would require considering 3 items together.
++HINT:  Increase join_collapse_limit to at least 3 to let the planner choose the join order for these items.
++ id 
++----
++(0 rows)
++
++RESET join_collapse_limit_excess;
++RESET join_collapse_limit;
+diff --git a/src/test/regress/parallel_schedule b/src/test/regress/parallel_schedule
+index 7b36f7c183b..920e10c4ab3 100644
+--- a/src/test/regress/parallel_schedule
++++ b/src/test/regress/parallel_schedule
+@@ -48,7 +48,7 @@ test: create_index create_index_spgist create_view index_including index_includi
+ # ----------
+ # Another group of parallel tests
+ # ----------
+-test: create_aggregate create_function_sql create_cast constraints triggers select inherit typed_table vacuum drop_if_exists updatable_views roleattributes create_am hash_func errors infinite_recurse
++test: create_aggregate create_function_sql create_cast constraints triggers select inherit typed_table vacuum drop_if_exists updatable_views roleattributes create_am hash_func errors infinite_recurse join_collapse_limit_excess
+ 
+ # ----------
+ # sanity_check does a vacuum, affecting the sort order of SELECT *
+diff --git a/src/test/regress/sql/join_collapse_limit_excess.sql b/src/test/regress/sql/join_collapse_limit_excess.sql
+new file mode 100644
+index 00000000000..54910dbfe88
+--- /dev/null
++++ b/src/test/regress/sql/join_collapse_limit_excess.sql
+@@ -0,0 +1,163 @@
++--
++-- JOIN_COLLAPSE_LIMIT_EXCESS
++--
++-- Exercise the join_collapse_limit_excess GUC, which selects what happens when
++-- the planner stops flattening explicit JOIN constructs because doing so would
++-- exceed join_collapse_limit: stay silent (off), emit a WARNING (warn), or
++-- raise an ERROR (error).  In the warn/error cases the base relations of the
++-- subproblem that could not be flattened are reported.
++--
++
++CREATE TEMP TABLE table_a (id int);
++CREATE TEMP TABLE table_b (id int);
++CREATE TEMP TABLE table_c (id int);
++
++-- Default is off.
++SHOW join_collapse_limit_excess;
++
++-- Only off/warn/error are accepted.
++SET join_collapse_limit_excess = 'bogus';
++
++-- Make the limit small so a modest explicit join exceeds it.
++SET join_collapse_limit = 2;
++
++-- A two-way join stays within the limit: no diagnostic even in error mode.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a JOIN table_b USING (id);
++
++-- A three-way explicit join exceeds join_collapse_limit = 2.
++
++-- warn: reports the relations but still plans and runs the query.
++SET join_collapse_limit_excess = 'warn';
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++
++-- error: the same query is rejected before execution.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++
++-- off: the historical behavior, silent.
++SET join_collapse_limit_excess = 'off';
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++
++-- The reported set includes non-table FROM items such as an
++-- optimization-fenced subquery, named by the alias SQL requires for it.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a JOIN table_b USING (id)
++  JOIN (SELECT id FROM table_c OFFSET 0) subquery USING (id);
++
++-- A FULL JOIN forces the join order independently of join_collapse_limit, so it
++-- must not trigger the diagnostic.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a FULL JOIN table_b USING (id) FULL JOIN table_c USING (id);
++
++-- The check runs during planning, so it also applies to queries planned via
++-- SPI (here, PL/pgSQL), and the error is a normal, trappable exception with
++-- SQLSTATE program_limit_exceeded.
++SET join_collapse_limit_excess = 'error';
++DO $$
++BEGIN
++  PERFORM * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++EXCEPTION WHEN program_limit_exceeded THEN
++  RAISE NOTICE 'caught program_limit_exceeded from join_collapse_limit_excess';
++END $$;
++
++-- The planner reaches the collapse decision once per JoinExpr, so a chain of
++-- explicit joins crosses the limit once per join as it is walked.  Only the
++-- outermost such subproblem is reported, so the chain yields one diagnostic
++-- however long it is, and the relation count reported matches the number of
++-- relations named.
++CREATE TEMP TABLE table_d (id int);
++CREATE TEMP TABLE table_e (id int);
++
++SET join_collapse_limit_excess = 'warn';
++
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id);
++
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id)
++  JOIN table_d USING (id);
++
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id)
++  JOIN table_d USING (id) JOIN table_e USING (id);
++
++-- error reports the same subproblem that warn does.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM table_a JOIN table_b USING (id) JOIN table_c USING (id)
++  JOIN table_d USING (id) JOIN table_e USING (id);
++
++-- That collapsing happens once per planning problem, not once per statement.
++-- A subquery that cannot be pulled up is planned on its own, so it is scanned
++-- for collapsing on its own and reported on its own.  Here two optimization
++-- fences each exceed the limit, and one statement yields two diagnostics.
++SET join_collapse_limit_excess = 'warn';
++SELECT * FROM
++  (SELECT table_a.id FROM table_a JOIN table_b USING (id)
++     JOIN table_c USING (id) OFFSET 0) fence_one,
++  (SELECT table_a.id FROM table_a JOIN table_b USING (id)
++     JOIN table_c USING (id) OFFSET 0) fence_two;
++
++-- error cannot report both: the first planning problem to exceed the limit
++-- aborts the statement before the second one is planned.
++SET join_collapse_limit_excess = 'error';
++SELECT * FROM
++  (SELECT table_a.id FROM table_a JOIN table_b USING (id)
++     JOIN table_c USING (id) OFFSET 0) fence_one,
++  (SELECT table_a.id FROM table_a JOIN table_b USING (id)
++     JOIN table_c USING (id) OFFSET 0) fence_two;
++
++-- Subproblems that do not enclose one another are reported separately, even
++-- within a single planning problem: here two comma-separated join chains each
++-- exceed the limit, and neither contains the other.
++SET join_collapse_limit_excess = 'warn';
++SELECT * FROM
++  table_a JOIN table_b USING (id) JOIN table_c USING (id),
++  table_d JOIN table_e USING (id) JOIN table_a AS a2 USING (id);
++
++-- Every kind of FROM item that can be a leaf of a join subproblem is named.
++-- RTE_RELATION and RTE_SUBQUERY are covered above; the rest follow.  Join RTEs
++-- are deliberately not named, since they are an artifact of the join itself
++-- rather than something the user can act on.  RTE_GROUP is never part of the
++-- jointree and RTE_GRAPH_TABLE is rewritten to a subquery before planning, so
++-- neither can reach the report.
++SET join_collapse_limit_excess = 'warn';
++
++-- RTE_VALUES.  A single-row VALUES is folded away by pull_up_simple_values(),
++-- so use two rows to keep it in the jointree.
++SELECT * FROM table_a JOIN table_b USING (id)
++  JOIN (VALUES (1), (2)) AS values_list(id) USING (id);
++
++-- RTE_FUNCTION
++SELECT * FROM table_a JOIN table_b USING (id)
++  JOIN generate_series(1, 2) AS function(id) USING (id);
++
++-- RTE_TABLEFUNC
++SELECT * FROM table_a JOIN table_b USING (id)
++  JOIN JSON_TABLE('[1]'::jsonb, '$[*]' COLUMNS (id int PATH '$')) AS json_table
++  USING (id);
++
++-- RTE_CTE
++WITH cte AS MATERIALIZED (SELECT 1 AS id)
++SELECT * FROM table_a JOIN table_b USING (id) JOIN cte USING (id);
++
++-- RTE_RESULT.  An empty-FROM subquery normally disappears, but one under an
++-- outer join survives to the planner as a jointree leaf.
++SELECT * FROM table_a JOIN table_b USING (id)
++  LEFT JOIN (SELECT 1 AS id) result ON result.id = table_a.id;
++
++-- RTE_NAMEDTUPLESTORE, via a trigger transition table.
++CREATE TEMP TABLE trig_t (id int);
++CREATE FUNCTION pg_temp.trig_f() RETURNS trigger LANGUAGE plpgsql AS $$
++BEGIN
++  PERFORM * FROM table_a JOIN table_b USING (id) JOIN new_rows USING (id);
++  RETURN NULL;
++END $$;
++CREATE TRIGGER trig_tr AFTER INSERT ON trig_t
++  REFERENCING NEW TABLE AS new_rows
++  FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.trig_f();
++INSERT INTO trig_t VALUES (1);
++
++-- RTE_JOIN is skipped: each outer join adds its own RTE to the subproblem, so
++-- this reports three relations rather than five.
++SELECT * FROM table_a LEFT JOIN table_b USING (id) LEFT JOIN table_c USING (id);
++
++RESET join_collapse_limit_excess;
++RESET join_collapse_limit;
+diff --git a/src/tools/pgindent/typedefs.list b/src/tools/pgindent/typedefs.list
+index e5634ae2969..55cc4a89c6d 100644
+--- a/src/tools/pgindent/typedefs.list
++++ b/src/tools/pgindent/typedefs.list
+@@ -1290,6 +1290,7 @@ JitProviderInit
+ JitProviderReleaseContextCB
+ JitProviderResetAfterErrorCB
+ Join
++JoinCollapseLimitExcess
+ JoinCostWorkspace
+ JoinDomain
+ JoinExpr
+-- 
+2.55.0
+
